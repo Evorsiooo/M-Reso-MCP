@@ -47,14 +47,21 @@ describe("mcp", () => {
     });
     const t = Date.parse("2026-11-03T17:00:00Z");
     const api = mockApi({
-      "/routers/default/index/clusters/SEM:A": { name: "A", lat: 45.1, lon: 5.7 },
-      "/routers/default/index/clusters/SEM:B": { name: "B", lat: 45.2, lon: 5.8 },
       "/routers/default/plan": { plan: { itineraries: [mk(t - 600000, t - 60000), mk(t - 300000, t - 30000)] } },
     });
-    const r = await call(api, "plan_arrive_by", { from_stop: "SEM:A", to_stop: "SEM:B", arrive_by: "2026-11-03T18:30" });
+    const r = await call(api, "plan_arrive_by", { from_stop: "45.1,5.7", to_stop: "45.2,5.8", arrive_by: "2026-11-03T18:30" });
     const out = JSON.parse(r.result.content[0].text);
     expect(out.latest_departure.departs).toBe("2026-11-03T17:55");
     expect(out.latest_departure.legs[0].stops_along_the_way).toHaveLength(1);
+  });
+
+  it("resolves stop names for the planner and rejects bare IDs", async () => {
+    const api = mockApi({ "/findType/json": { features: [{ properties: { name: "Chavant", city: "Grenoble", visible: true }, geometry: { coordinates: [5.73, 45.18] } }] }, "/routers/default/plan": { plan: { itineraries: [] } } });
+    const ok = JSON.parse((await call(api, "plan_depart_at", { from_stop: "Chavant", to_stop: "45.1,5.7", depart_at: "08:00" })).result.content[0].text);
+    expect(ok.found).toBe(false);
+    expect(ok.resolved.from).toContain("Chavant");
+    const bad = await call(api, "plan_depart_at", { from_stop: "SEM:CHV", to_stop: "45.1,5.7", depart_at: "08:00" });
+    expect(bad.result.isError).toBe(true);
   });
 
   it("reports API errors as tool errors", async () => {

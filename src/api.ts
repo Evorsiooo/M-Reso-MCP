@@ -20,7 +20,11 @@ export class MApi {
       // The Mobilités M API asks clients to identify themselves via the origin header.
       headers: { accept: "application/json", origin: "m-reso-mcp" },
     });
-    if (!res.ok) throw new ApiError(res.status, `Mobilités M API ${res.status} for ${url.pathname}`);
+    if (res.status === 204) return null as T; // the API answers 204 with an empty body for "no results"
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => "")).slice(0, 200);
+      throw new ApiError(res.status, `Mobilités M API ${res.status} for ${url.pathname}${detail ? `: ${detail}` : ""}`);
+    }
     return (await res.json()) as T;
   }
 
