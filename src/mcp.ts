@@ -14,7 +14,7 @@ async function handle(r: Req, api: MApi) {
       return ok(r.id, {
         protocolVersion: PROTOCOL,
         capabilities: { tools: {} },
-        serverInfo: { name: "m-reso-mcp", version: "0.1.0" },
+        serverInfo: { name: "m-reso-mcp", version: "0.2.0" },
         instructions: "Grenoble public transport (Mobilités M). Use stop_search first to get stop IDs.",
       });
     case "ping":
