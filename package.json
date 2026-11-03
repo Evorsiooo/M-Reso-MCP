@@ -1,0 +1,19 @@
+{
+  "name": "m-reso-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remote MCP server (Cloudflare Worker) wrapping the Mobilités M open data API for Grenoble transport",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.0.0"
+  }
+}

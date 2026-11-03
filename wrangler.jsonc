@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "m-reso-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "observability": { "enabled": true },
+  "vars": {
+    "MOBILITES_API_BASE": "https://data.mobilites-m.fr/api"
+  }
+}
