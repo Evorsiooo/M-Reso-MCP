@@ -41,3 +41,5 @@ npm run dev      # local at http://localhost:8787/mcp
 Cloudflare dashboard → Workers & Pages → Create → Import a repository → select this repo, branch `main`.
 Build command: *(none)*, deploy command: `npx wrangler deploy`. The Worker name must match `name` in `wrangler.jsonc` (`m-reso-mcp`).
 Every push to `main` then deploys automatically.
+
+Every push to `main` is built and deployed by Cloudflare Workers Builds.
