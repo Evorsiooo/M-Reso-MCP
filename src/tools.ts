@@ -15,7 +15,7 @@ const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
 });
 
 const STOP_HINT =
-  "Coordinates 'lat,lon' (from stop_search) or a stop name such as 'Chavant'.";
+  "Coordinates 'lat,lon', a stop name such as 'Chavant', or an address/place such as '2 Rue Pierre Sémard, Grenoble' or 'Lycée Vaucanson'.";
 
 /* ---------- helpers ---------- */
 
@@ -39,8 +39,71 @@ async function searchClusters(api: MApi, query: string) {
   const byId = new Map<string, any>();
   for (const w of words) for (const f of visible(await api.get("/findType/json", { types: "clusters", query: w }))) byId.set(f.properties.id, f);
   const score = (f: any) => words.filter((w) => norm(`${f.properties.name} ${f.properties.city}`).includes(w)).length;
-  return [...byId.values()].sort((x, y) => score(y) - score(x)).filter((f) => score(f) > 0);
+  return [...byId.values()].filter((f) => score(f) === words.length); // every word must match, else it is not this stop
 }
+
+interface Place { name: string; kind: string; city?: string; coordinates: string; approximate?: boolean }
+
+/**
+ * Geocode an address ("2 Rue Pierre Sémard, Grenoble"), a street or a point of interest
+ * (school, pool, hospital...). Uses the API's street and POI indexes; house numbers are
+ * resolved to the exact point when known, else to the nearest known number on the street.
+ */
+async function geocode(api: MApi, raw: string): Promise<Place[]> {
+  let q = raw.trim();
+  let city: string | undefined;
+  if (q.includes(",")) {
+    const [head, ...rest] = q.split(",");
+    q = head;
+    city = norm(rest.join(" ").trim()) || undefined;
+  }
+  const m = q.trim().match(/^(\d+)\s*(?:bis|ter|quater)?[\s,]+(.+)$/i);
+  const number = m ? Number(m[1]) : undefined;
+  if (m) q = m[2];
+  q = q.trim();
+  const get = (types: string) => api.get("/findType/json", { types, query: q }).catch(() => null) as Promise<any>;
+  const [pois, streets] = await Promise.all([get("lieux"), get("rue")]);
+  const cityOk = (c?: string) => !city || norm(c ?? "").includes(city);
+
+  const poiPlaces: Place[] = ((pois?.features ?? []) as any[])
+    .filter((f) => f.geometry?.coordinates && cityOk(f.properties?.COMMUNE ?? f.properties?.commune ?? f.properties?.city))
+    .map((f) => ({
+      name: f.properties.LIBELLE ?? f.properties.name,
+      kind: "place",
+      city: f.properties.COMMUNE ?? f.properties.commune ?? f.properties.city,
+      coordinates: `${f.geometry.coordinates[1]},${f.geometry.coordinates[0]}`,
+    }));
+
+  const streetPlaces: Place[] = ((streets?.features ?? []) as any[])
+    .filter((f) => cityOk(f.properties?.COMMUNE))
+    .sort((x, y) => (y.properties.importance ?? 0) - (x.properties.importance ?? 0))
+    .map((f) => {
+      const nums = Object.entries(f.properties.numero ?? {}) as [string, any][];
+      let pt: { lat: number; lon: number } | undefined;
+      let approximate = false;
+      if (number !== undefined && nums.length) {
+        const exact = nums.find(([n]) => Number(n) === number);
+        const nearest = exact ?? nums.sort((x, y) => Math.abs(Number(x[0]) - number) - Math.abs(Number(y[0]) - number))[0];
+        pt = nearest[1];
+        approximate = !exact;
+      } else if (f.geometry?.coordinates) {
+        pt = { lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1] };
+        approximate = number === undefined ? false : true;
+      }
+      if (!pt) return null;
+      return {
+        name: `${number !== undefined ? number + " " : ""}${f.properties.LIBELLE}`,
+        kind: "address",
+        city: f.properties.COMMUNE,
+        coordinates: `${pt.lat},${pt.lon}`,
+        ...(approximate && { approximate: true }),
+      } as Place;
+    })
+    .filter((x): x is Place => x !== null);
+
+  return number !== undefined ? [...streetPlaces, ...poiPlaces] : [...poiPlaces, ...streetPlaces];
+}
+const placeLabel = (p: Place) => `${p.name} (${p.city ?? "?"})${p.approximate ? " ~approximate" : ""}`;
 
 /** The planner needs coordinates: accept "lat,lon" or a stop name (resolved through stop search). */
 async function resolvePlace(api: MApi, input: string): Promise<{ place: string; label: string }> {
@@ -49,17 +112,23 @@ async function resolvePlace(api: MApi, input: string): Promise<{ place: string; 
   if (/^[A-Z0-9]+:[A-Z0-9_]+$/i.test(s)) {
     throw new Error(`The planner needs coordinates, not the ID "${s}". Pass "lat,lon" from stop_search, or the stop name.`);
   }
-  const hits = await searchClusters(api, s);
-  const f = hits[0];
-  if (!f) throw new Error(`No stop found for "${s}". Try stop_search.`);
-  const [lon, lat] = f.geometry.coordinates;
-  return { place: `${lat},${lon}`, label: `${f.properties.name} (${f.properties.city})` };
+  const isAddress = /^\d+\s*(bis|ter)?[\s,]/i.test(s); // starts with a house number
+  if (!isAddress) {
+    const f = (await searchClusters(api, s))[0];
+    if (f) {
+      const [lon, lat] = f.geometry.coordinates;
+      return { place: `${lat},${lon}`, label: `${f.properties.name} (${f.properties.city})` };
+    }
+  }
+  const g = (await geocode(api, s))[0];
+  if (!g) throw new Error(`No stop, address or place found for "${s}". Try place_search or stop_search.`);
+  return { place: g.coordinates, label: `${placeLabel(g)} [${g.kind}, not a stop]` };
 }
 
 const timeOf = (p: any, key: "start" | "end") => (key === "start" ? p.departure ?? p.startTime : p.arrival ?? p.endTime);
 
-function summariseItinerary(it: any) {
-  return {
+function summariseItinerary(it: any, withStops = true) {
+  const out = {
     departs: localIso(it.startTime),
     arrives: localIso(it.endTime),
     duration_min: Math.round(it.duration / 60),
@@ -77,12 +146,18 @@ function summariseItinerary(it: any) {
         line_id: `${String(l.agencyId ?? "SEM:SEM").split(":")[0]}:${l.routeShortName}`,
         headsign: l.headsign,
         realtime: !!l.realTime,
-        stops_along_the_way: (l.intermediateStops ?? []).map((s: any) => ({
-          name: s.name,
-          time: hhmm(s.departure ?? s.arrival),
-        })),
+        ...(withStops && {
+          stops_along_the_way: (l.intermediateStops ?? []).map((s: any) => ({ name: s.name, time: hhmm(s.departure ?? s.arrival) })),
+        }),
       };
     }),
+  };
+  const t = out.legs.filter((l: any) => l.line);
+  return {
+    summary: t.length
+      ? t.map((l: any) => `${l.line} ${l.from.time} ${l.from.name} → ${l.to.time} ${l.to.name}`).join(" ; then ") + ` (arrive ${hhmm(it.endTime)})`
+      : `Walk only, ${Math.round(it.duration / 60)} min`,
+    ...out,
   };
 }
 
@@ -91,14 +166,37 @@ async function plan(api: MApi, a: any, arriveBy: boolean) {
   const from = fromR.place, to = toR.place;
   const resolved = { from: fromR.label, to: toR.label };
   const { date, time } = toLocalDateTime(arriveBy ? a.arrive_by : a.depart_at);
-  const data: any = await api.get("/routers/default/plan", {
-    fromPlace: from, toPlace: to, date, time, arriveBy,
+  const query = (f: string, t: string) => api.get<any>("/routers/default/plan", {
+    fromPlace: f, toPlace: t, date, time, arriveBy,
     mode: "TRANSIT,WALK",
     showIntermediateStops: true,
     numItineraries: arriveBy ? 6 : Math.min(Math.max(a.max_options ?? 4, 1), 8),
     maxWalkDistance: a.max_walk_m ?? 1000,
   });
-  const its: any[] = data?.plan?.itineraries ?? [];
+  let data: any = await query(from, to);
+  // A geocoded point can sit off the walking network (school grounds, building footprint): nudge it a little.
+  let adjusted: string | undefined;
+  const missing: string[] = data?.error?.missing ?? [];
+  if (data?.error?.message === "LOCATION_NOT_ACCESSIBLE" && missing.length === 1) {
+    const isFrom = missing[0] === "FROM_PLACE";
+    const [lat, lon] = (isFrom ? from : to).split(",").map(Number);
+    const d = [0.0004, 0.001];
+    const offsets = d.flatMap((k) => [[k, 0], [-k, 0], [0, k * 1.4], [0, -k * 1.4]]);
+    for (const [dy, dx] of offsets) {
+      const alt = `${(lat + dy).toFixed(6)},${(lon + dx).toFixed(6)}`;
+      const r = await query(isFrom ? alt : from, isFrom ? to : alt);
+      if (!r?.error && r?.plan?.itineraries?.length) {
+        data = r;
+        adjusted = `${isFrom ? "Origin" : "Destination"} moved ~${Math.round(Math.hypot(dy * 111000, dx * 78000))} m to reach the walking network.`;
+        break;
+      }
+    }
+  }
+  let its: any[] = data?.plan?.itineraries ?? [];
+  // Drop walk-only options when a transit option exists (unless asked to keep them).
+  const transit = its.filter((i) => (i.legs ?? []).some((l: any) => l.transitLeg));
+  if (transit.length && !a.include_walk_only) its = transit;
+  const withStops = a.include_stops ?? arriveBy;
   if (!its.length) {
     return { found: false, resolved, message: data?.error?.message ?? data?.error?.msg ?? "No journey found.", requested: { date, time } };
   }
@@ -109,12 +207,13 @@ async function plan(api: MApi, a: any, arriveBy: boolean) {
     return {
       found: true,
       resolved,
+      ...(adjusted && { note: adjusted }),
       requested_arrival: `${date}T${time}`,
-      latest_departure: summariseItinerary(sorted[0]),
-      alternatives: sorted.slice(1, 4).map(summariseItinerary),
+      latest_departure: summariseItinerary(sorted[0], withStops),
+      alternatives: sorted.slice(1, 4).map((i) => summariseItinerary(i, false)),
     };
   }
-  return { found: true, resolved, requested_departure: `${date}T${time}`, options: its.map(summariseItinerary) };
+  return { found: true, resolved, ...(adjusted && { note: adjusted }), requested_departure: `${date}T${time}`, options: its.map((i) => summariseItinerary(i, withStops)) };
 }
 
 /* ---------- tools ---------- */
@@ -129,6 +228,8 @@ export const tools: Tool[] = [
       to_stop: str(`Alighting stop. ${STOP_HINT}`),
       arrive_by: str("Latest acceptable arrival, ISO local time like 2026-11-03T18:30, or HH:mm for today."),
       max_walk_m: num("Max walking distance in metres (default 1000)."),
+      include_stops: { type: "boolean", description: "List the stops passed along the way (default true; alternatives never list them)." },
+      include_walk_only: { type: "boolean", description: "Keep walking-only options (dropped by default when transit exists)." },
     }, ["from_stop", "to_stop", "arrive_by"]),
     handler: (a, api) => plan(api, a, true),
   },
@@ -140,6 +241,8 @@ export const tools: Tool[] = [
       to_stop: str(`Alighting stop. ${STOP_HINT}`),
       depart_at: str("Earliest departure, ISO local time like 2026-11-03T08:15, or HH:mm for today."),
       max_options: num("Number of options (1-8, default 4)."),
+      include_stops: { type: "boolean", description: "List the stops passed along the way (default false)." },
+      include_walk_only: { type: "boolean", description: "Keep walking-only options (dropped by default when transit exists)." },
       max_walk_m: num("Max walking distance in metres (default 1000)."),
     }, ["from_stop", "to_stop", "depart_at"]),
     handler: (a, api) => plan(api, a, false),
@@ -186,13 +289,25 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "place_search",
+    description:
+      "Geocode an address, street or point of interest (school, pool, hospital...) to coordinates for the planners and shared_mobility. Accepts house numbers and an optional city after a comma, e.g. '2 Rue Pierre Sémard, Grenoble' or 'Lycée Vaucanson'. Results marked approximate use the nearest known house number.",
+    inputSchema: obj({ query: str("Address, street or place name."), limit: num("Max results (default 5).") }, ["query"]),
+    handler: async (a, api) => ({ places: (await geocode(api, a.query)).slice(0, a.limit ?? 5) }),
+  },
+  {
     name: "stop_search",
     description:
       "Find stops by name (e.g. 'chavant', 'gare grenoble'). Returns the stop ID/code (for next_departures and line_info) and coordinates (for the planners).",
     inputSchema: obj({ query: str("Stop name or part of it."), limit: num("Max results (default 10).") }, ["query"]),
     handler: async (a, api) => {
       const feats = await searchClusters(api, a.query);
+      const places = feats.length ? [] : (await geocode(api, a.query)).slice(0, 5);
       return {
+        ...(places.length && {
+          note: "No stop with that name. These are addresses/places (see place_search); pass their coordinates to the planners.",
+          places,
+        }),
         stops: feats.slice(0, a.limit ?? 10).map((f) => ({
           id: f.properties.id,
           code: f.properties.code,
@@ -244,8 +359,11 @@ export const tools: Tool[] = [
   },
   {
     name: "disruptions",
-    description: "Current service alerts for the whole network, or for one line (e.g. SEM:A or just A).",
-    inputSchema: obj({ line: str("Optional line ID, e.g. SEM:A.") }),
+    description: "Current service alerts for the whole network, or for one line (e.g. SEM:C8), newest first. Open-ended alerts are hidden unless requested.",
+    inputSchema: obj({
+      line: str("Optional line ID, e.g. SEM:A."),
+      include_open_ended: { type: "boolean", description: "Include alerts with no real end date (ending 2+ years away). Default false." },
+    }),
     handler: async (a, api) => {
       const data: Record<string, any> = (await api.get("/dyn/evtTC/json")) ?? {};
       const want = a.line ? String(a.line).replace(":", "_") : null;
@@ -259,9 +377,11 @@ export const tools: Tool[] = [
         .filter((e: any) => {
           if (parse(e.dateDebut) > now + 3600_000 * 24) return false; // not yet relevant
           if (parse(e.dateFin) < now) return false;
+          if (!a.include_open_ended && parse(e.dateFin) > now + 2 * 365 * 86400_000) return false;
           if (!want) return true;
           return String(e.listeLigne ?? "").split(",").map((x) => x.trim()).some((x) => x === want || x === wantBare);
         })
+        .sort((x: any, y: any) => parse(y.dateDebut) - parse(x.dateDebut))
         .map((e: any) => ({
           title: e.titre, description: e.description, from: e.dateDebut, until: e.dateFin,
           lines: e.listeLigne, stops: e.listeArret, pdf: e.plan || undefined,

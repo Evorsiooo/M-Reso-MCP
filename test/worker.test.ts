@@ -23,10 +23,10 @@ describe("time", () => {
 });
 
 describe("mcp", () => {
-  it("lists 8 tools", async () => {
+  it("lists 9 tools", async () => {
     const r: any = await handleMcp({ jsonrpc: "2.0", id: 1, method: "tools/list" }, mockApi({}));
     expect(r.result.tools.map((t: any) => t.name)).toEqual([
-      "plan_arrive_by", "plan_depart_at", "next_departures", "stop_search",
+      "plan_arrive_by", "plan_depart_at", "next_departures", "place_search", "stop_search",
       "line_info", "disruptions", "shared_mobility", "car_park_availability",
     ]);
   });
